@@ -1,1 +1,1 @@
-com.example.demo
+com.moemod.cquery

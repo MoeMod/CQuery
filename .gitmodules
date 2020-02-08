@@ -1,3 +1,6 @@
 [submodule "extern/cqcppsdk"]
 	path = extern/cqcppsdk
 	url = https://github.com/cqmoe/cqcppsdk.git
+[submodule "extern/boost-cmake"]
+	path = extern/boost-cmake
+	url = https://github.com/Orphis/boost-cmake

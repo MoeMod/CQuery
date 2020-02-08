@@ -114,14 +114,7 @@
         }
     ],
     "menu": [ // name 字段为显示在酷Q应用菜单中的文字, function 字段对应 CQ_MENU 宏调用的参数
-        {
-            "name": "菜单 1",
-            "function": "menu_demo_1"
-        },
-        {
-            "name": "菜单 2",
-            "function": "menu_demo_2"
-        }
+
     ],
     "status": [],
     "auth": [ // 需要根据 API 调用情况来注释或取消注释这里的项
@@ -140,15 +133,15 @@
         // 126, // set_group_card
         // 127, // set_group_leave
         // 128, // set_group_special_title
-        130, // get_group_member_info
-        131, // get_stranger_info
-        132, // get_group_info
+        // 130, // get_group_member_info
+        // 131, // get_stranger_info
+        // 132, // get_group_info
         // 140, // set_discuss_leave
         // 150, // set_friend_request
         // 151, // set_group_request
-        160, // get_group_member_list
-        161, // get_group_list
-        162, // get_friend_list
+        // 160, // get_group_member_list
+        // 161, // get_group_list
+        // 162, // get_friend_list
         180 // delete_message
     ]
 }
