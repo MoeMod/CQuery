@@ -116,5 +116,5 @@ public:
 
 private:
     struct impl_t;
-    std::shared_ptr<impl_t> pimpl;
+    const std::shared_ptr<impl_t> pimpl;
 };
