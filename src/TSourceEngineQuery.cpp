@@ -1,28 +1,32 @@
 #include <iostream>
 #include <memory>
 #include <boost/asio.hpp>
+#include <future>
 
 #include "TSourceEngineQuery.h"
+#include "GlobalContext.h"
 #include "parsemsg.h"
 
 using namespace std::chrono_literals;
 using boost::asio::ip::udp;
 
 struct TSourceEngineQuery::impl_t {
-    boost::asio::io_context io_context;
-    udp::socket socket_info{ io_context, udp::endpoint(udp::v4(), 0) };
-    udp::socket socket_player{ io_context, udp::endpoint(udp::v4(), 0) };
-
+    std::shared_ptr<boost::asio::io_context> ioc = GlobalContextSingleton();
 };
-
-std::string UTF8_To_ANSI(const std::string &str)
-{
-    return str;
-}
 
 TSourceEngineQuery::TSourceEngineQuery() : pimpl(std::make_shared<impl_t>())
 {
 
+}
+
+TSourceEngineQuery::~TSourceEngineQuery()
+{
+
+}
+
+std::string UTF8_To_ANSI(const std::string &str)
+{
+    return str;
 }
 
 auto TSourceEngineQuery::MakeServerInfoQueryResultFromBuffer(const char *reply, std::size_t reply_length, std::string address, uint16_t port) -> ServerInfoQueryResult
@@ -98,7 +102,7 @@ auto TSourceEngineQuery::MakeServerInfoQueryResultFromBuffer(const char *reply, 
     }
     else
     {
-        throw std::runtime_error("不支持的协议格式");
+        throw std::runtime_error("不支持的服务器信息协议格式");
     }
     result.FromAddress = std::move(address);
     result.FromPort = port;
@@ -136,78 +140,151 @@ auto TSourceEngineQuery::MakePlayerListQueryResultFromBuffer(const char *reply, 
     }
     else
     {
-        throw std::runtime_error("不支持的协议格式");
+        throw std::runtime_error("不支持的玩家列表协议格式");
     }
     return result;
 }
 
 template<class T>
-auto ReceiveServerQueryResultAsync(std::shared_ptr<udp::socket> spSocket, std::function<T(const char *reply, std::size_t reply_length, std::string address, uint16_t port)> handler) -> std::shared_future<T>
+void try_set_exception(std::promise<T>& pro, std::exception_ptr exc)
 {
-    struct HandleData
-    {
-        std::array<char, 4096> buffer;
-        udp::endpoint sender_endpoint;
-        std::shared_future<T> saved_future; // 保存避免阻塞...
-        std::function<T(const char *reply, std::size_t reply_length, std::string address, uint16_t port)> handler;
+    try {
+        pro.set_exception(exc);
+    }
+    catch (std::future_error&) {
+        // ...
+    }
+}
+
+template<class Ret, class Handler, class NewRet = typename std::invoke_result<Handler, Ret>::type>
+std::future<NewRet> then(boost::asio::io_context & ioc, std::future<Ret> &fut, Handler fn)
+{
+    struct Context {
+        std::future<Ret> fut;
+        std::promise<NewRet> pro;
     };
-
-    auto hd = std::make_shared<HandleData>();
-    hd->handler = std::move(handler);
-
-    std::shared_future<T> sf = std::async( std::launch::async, [spSocket, hd]() -> T {
-        auto reply_length = spSocket->receive_from(boost::asio::buffer(hd->buffer.data(), 4096), hd->sender_endpoint);
-        return hd->handler(hd->buffer.data(), reply_length, hd->sender_endpoint.address().to_string(), hd->sender_endpoint.port());
+    std::shared_ptr<Context> con = std::make_shared<Context>();
+    con->fut = std::move(fut);
+    std::future<NewRet> ret = con->pro.get_future();
+    ioc.dispatch([fn, con]{
+        try {
+            if constexpr (std::is_void_v<NewRet>)
+                con->pro.set_value();
+            else
+                con->pro.set_value(fn(con->fut.get()));
+        }
+        catch (...) {
+            con->pro.set_exception(std::current_exception());
+        }
     });
-    hd->saved_future = sf;
-    // 为了NRVO优化不建议与上一行合并
-    return sf;
+    return ret;
 }
 
 // Reference: https://developer.valvesoftware.com/wiki/Server_queries#A2S_INFO
-auto TSourceEngineQuery::GetServerInfoDataAsync(const char *host, const char *port) -> std::shared_future<ServerInfoQueryResult>
+auto TSourceEngineQuery::GetServerInfoDataAsync(const char *host, const char *port, std::chrono::seconds timeout) -> std::future<ServerInfoQueryResult>
 {
     // 发送查询包
-    constexpr char request1[] = "\xFF\xFF\xFF\xFF" "TSource Engine Query"; // Source / GoldSrc Steam
-    //constexpr char request2[] = "\xFF\xFF\xFF\xFF" "details"; // GoldSrc WON
-    //constexpr char request3[] = "\xFF\xFF\xFF\xFF" "info"; // Xash3D
-    for (auto endpoint : udp::resolver(pimpl->io_context).resolve(udp::v4(), host, port))
-    {
-        pimpl->socket_info.send_to(boost::asio::buffer(request1, sizeof(request1)), endpoint);
-        //pimpl->socket_info.send_to(boost::asio::buffer(request2, sizeof(request2)), endpoint);
-        //pimpl->socket_info.send_to(boost::asio::buffer(request3, sizeof(request3)), endpoint);
-    }
+    std::shared_ptr<std::promise<ServerInfoQueryResult>> pro = std::make_shared<std::promise<ServerInfoQueryResult>>();
+    std::shared_ptr<boost::asio::io_context> ioc = pimpl->ioc;
+    std::shared_ptr<udp::resolver> resolver = std::make_shared<udp::resolver>(*ioc);
+    
+    resolver->async_resolve(udp::v4(), host, port, [resolver, ioc, pro, timeout](boost::system::error_code ec, udp::resolver::results_type endpoints) {
+        if(ec)
+            return try_set_exception(*pro, std::make_exception_ptr(boost::system::system_error(ec, "解析域名时发生错误"))), void();
 
-    return ReceiveServerQueryResultAsync<ServerInfoQueryResult>(std::shared_ptr<udp::socket>(pimpl, &pimpl->socket_info), MakeServerInfoQueryResultFromBuffer);
+        std::shared_ptr<udp::socket> socket = std::make_shared<udp::socket>(*ioc, udp::endpoint(udp::v4(), 0));
+        for(auto &&endpoint : endpoints)
+        {
+            static constexpr char request1[] = "\xFF\xFF\xFF\xFF" "TSource Engine Query"; // Source / GoldSrc Steam
+            //static constexpr char request2[] = "\xFF\xFF\xFF\xFF" "details"; // GoldSrc WON
+            //static constexpr char request3[] = "\xFF\xFF\xFF\xFF" "info"; // Xash3D
+
+            socket->async_send_to(boost::asio::buffer(request1, sizeof(request1)), endpoint, [socket, endpoint, pro](boost::system::error_code ec, std::size_t bytes_transferred) {
+                if(ec)
+                    return try_set_exception(*pro, std::make_exception_ptr(boost::system::system_error(ec, "发送服务器信息查询包时发生错误"))), void();
+                std::shared_ptr<char> buffer(new char[8192], std::default_delete<char[]>());
+                std::shared_ptr<udp::endpoint> sender_endpoint = std::make_shared<udp::endpoint>(udp::v4(), 0);
+                socket->async_receive_from(boost::asio::buffer(buffer.get(), 8192), *sender_endpoint, [socket, buffer, sender_endpoint, pro](boost::system::error_code ec, std::size_t reply_length) {
+                    if (ec)
+                        return try_set_exception(*pro, std::make_exception_ptr(boost::system::system_error(ec, "接收服务器信息查询包时发生错误"))), void();
+
+                    try{
+                        return pro->set_value(MakeServerInfoQueryResultFromBuffer(buffer.get(), reply_length, sender_endpoint->address().to_string(), sender_endpoint->port())), void();
+                    } catch(...) {
+                        return try_set_exception(*pro, std::current_exception()), void();
+                    }
+                });
+            });
+        }
+
+        std::shared_ptr<boost::asio::system_timer> ddl = std::make_shared<boost::asio::system_timer>(*ioc);
+        ddl->expires_from_now(timeout);
+        ddl->async_wait([ioc, socket, pro, ddl](boost::system::error_code ec){
+            socket->close(ec);
+            return try_set_exception(*pro, std::make_exception_ptr(boost::system::system_error(boost::asio::error::make_error_code(boost::asio::error::timed_out), "查询服务器超时，可能是服务器挂了或者IP不正确。"))), void();
+        });
+    });
+    return pro->get_future();
 }
 
-auto TSourceEngineQuery::GetPlayerListDataAsync(const char *host, const char *port) -> std::shared_future<PlayerListQueryResult>
+auto TSourceEngineQuery::GetPlayerListDataAsync(const char *host, const char *port, std::chrono::seconds timeout) -> std::future<PlayerListQueryResult>
 {
-    // 同步发送challenge查询包
-    constexpr char request[] = "\xFF\xFF\xFF\xFF" "U" "\xFF\xFF\xFF\xFF";
-    auto resolve_result = udp::resolver(pimpl->io_context).resolve(udp::v4(), host, port);
-    for (auto endpoint : resolve_result)
-    {
-        pimpl->socket_player.send_to(boost::asio::buffer(request, sizeof(request)), endpoint);
-    }
+    std::shared_ptr<std::promise<PlayerListQueryResult>> pro = std::make_shared<std::promise<PlayerListQueryResult>>();
+    std::shared_ptr<boost::asio::io_context> ioc = pimpl->ioc;
+    std::shared_ptr<udp::resolver> resolver = std::make_shared<udp::resolver>(*ioc);
 
-    // 同步接收challenge查询包
-    std::shared_future<PlayerListQueryResult> result = ReceiveServerQueryResultAsync<PlayerListQueryResult>(std::shared_ptr<udp::socket>(pimpl, &pimpl->socket_player), MakePlayerListQueryResultFromBuffer);
+    resolver->async_resolve(udp::v4(), host, port, [resolver, ioc, pro, timeout](boost::system::error_code ec, udp::resolver::results_type endpoints) {
+        if(ec)
+            return try_set_exception(*pro, std::make_exception_ptr(boost::system::system_error(ec, "解析域名时发生错误"))), void();
+        std::shared_ptr<udp::socket> socket = std::make_shared<udp::socket>(*ioc, udp::endpoint(udp::v4(), 0));
+        for(auto &&endpoint : endpoints)
+        {
+            // first attempt
+            constexpr char request_challenge[] = "\xFF\xFF\xFF\xFF" "U" "\xFF\xFF\xFF\xFF";
+            socket->async_send_to(boost::asio::buffer(request_challenge, sizeof(request_challenge)), endpoint, [socket, endpoint, pro](boost::system::error_code ec, std::size_t bytes_transferred) {
+                if(ec)
+                    return try_set_exception(*pro, std::make_exception_ptr(boost::system::system_error(ec, "发送玩家查询包时发生错误"))), void();
+                std::shared_ptr<char> buffer(new char[4096], std::default_delete<char[]>());
+                std::shared_ptr<udp::endpoint> sender_endpoint = std::make_shared<udp::endpoint>(udp::v4(), 0);
+                socket->async_receive_from(boost::asio::buffer(buffer.get(), 4096), *sender_endpoint, [socket, endpoint, buffer, sender_endpoint, pro](boost::system::error_code ec, std::size_t reply_length) {
+                    if (ec)
+                        return try_set_exception(*pro, std::make_exception_ptr(boost::system::system_error(ec, "无法接收玩家查询包"))), void();
 
-    if (result.wait_for(500ms) != std::future_status::ready)
-        return std::async([]() -> PlayerListQueryResult { throw std::runtime_error("服务器未响应，未接收到challenge number。"); });
+                    PlayerListQueryResult first_result;
+                    try{
+                        first_result = MakePlayerListQueryResultFromBuffer(buffer.get(), reply_length, sender_endpoint->address().to_string(), sender_endpoint->port());
+                        if(first_result.Results.index() == 1)
+                            return pro->set_value(first_result), void();
+                    } catch(...) {
+                        return try_set_exception(*pro, std::current_exception()), void();
+                    }
 
-    // 再次发送查询
-    auto &&await_result = result.get();
-    if (await_result.Results.index() == 1)
-        return result;
-
-    const int32_t challenge = std::get<int32_t>(await_result.Results);
-    const char(&accessor)[4] = reinterpret_cast<const char(&)[4]>(challenge);
-    char request3[10] = { '\xFF', '\xFF', '\xFF', '\xFF', 'U', accessor[0], accessor[1], accessor[2], accessor[3], '\0' };
-
-    for (auto endpoint : resolve_result)
-        pimpl->socket_player.send_to(boost::asio::buffer(request3, sizeof(request3)), endpoint);
-
-    return result = ReceiveServerQueryResultAsync<PlayerListQueryResult>(std::shared_ptr<udp::socket>(pimpl, &pimpl->socket_player), MakePlayerListQueryResultFromBuffer);
+                    // second attempt
+                    const int32_t challenge = std::get<int32_t>(first_result.Results);
+                    const char(&accessor)[4] = reinterpret_cast<const char(&)[4]>(challenge);
+                    char request3[10] = { '\xFF', '\xFF', '\xFF', '\xFF', 'U', accessor[0], accessor[1], accessor[2], accessor[3], '\0' };
+                    socket->async_send_to(boost::asio::buffer(request3, sizeof(request3)), endpoint, [socket, buffer, sender_endpoint, endpoint, pro](boost::system::error_code ec, std::size_t bytes_transferred) {
+                        if (ec)
+                            return try_set_exception(*pro, std::make_exception_ptr(boost::system::system_error(ec, "发送challenge玩家查询包时发生错误"))), void();
+                        socket->async_receive_from(boost::asio::buffer(buffer.get(), 4096), *sender_endpoint, [socket, endpoint, buffer, sender_endpoint, pro](boost::system::error_code ec, std::size_t reply_length) {
+                            if (ec)
+                                return try_set_exception(*pro, std::make_exception_ptr(boost::system::system_error(ec, "无法接收challenge玩家查询包"))), void();
+                            try{
+                                return pro->set_value(MakePlayerListQueryResultFromBuffer(buffer.get(), reply_length, sender_endpoint->address().to_string(), sender_endpoint->port())), void();
+                            } catch(...) {
+                                return try_set_exception(*pro, std::current_exception()), void();
+                            }
+                        });
+                    });
+                });
+            });
+        }
+        std::shared_ptr<boost::asio::system_timer> ddl = std::make_shared<boost::asio::system_timer>(*ioc);
+        ddl->expires_from_now(timeout);
+        ddl->async_wait([ioc, socket, pro, ddl](boost::system::error_code ec){
+            socket->close(ec);
+            return try_set_exception(*pro, std::make_exception_ptr(boost::system::system_error(boost::asio::error::make_error_code(boost::asio::error::timed_out), "查询服务器超时，可能是服务器挂了或者IP不正确。"))), void();
+        });
+    });
+    return pro->get_future();
 }

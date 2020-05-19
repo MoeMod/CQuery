@@ -9,43 +9,35 @@
 using namespace cq;
 using namespace std::chrono_literals;
 
-std::string QueryServerInfo(const char *host, const char *port) noexcept(false)
-{
-    TSourceEngineQuery tseq;
-    auto finfo = tseq.GetServerInfoDataAsync(host, port);
-    auto fplayer = tseq.GetPlayerListDataAsync(host, port);
-
-    if (finfo.wait_for(500ms) != std::future_status::timeout)
-    {
+std::string QueryServerInfo(const std::string &host, const std::string &port) noexcept(false) {
+    try {
+        TSourceEngineQuery tseq;
+        auto finfo = tseq.GetServerInfoDataAsync(host.c_str(), port.c_str(), 2s);
+        auto fplayer = tseq.GetPlayerListDataAsync(host.c_str(), port.c_str(), 2s);
         auto result = finfo.get(); // try
         std::ostringstream oss;
-        oss << result.ServerName  << std::endl;
-        oss << "\t" << result.Map << " (" << result.PlayerCount << "/" << result.MaxPlayers << ") - " << result.FromAddress << ":" << result.FromPort << std::endl;
+        oss << result.ServerName << std::endl;
+        oss << "\t" << result.Map << " (" << result.PlayerCount << "/" << result.MaxPlayers << ") - "
+            << result.FromAddress << ":" << result.FromPort << std::endl;
+        oss << "\t" << result.Game << " / " << int(result.Protocol) << " / " << EnvironmentName(result.Environment)
+            << std::endl;
 
         std::string myReply = oss.str();
-
-        if (finfo.wait_for(1000ms) == std::future_status::ready)
-        {
-            try
-            {
-                auto playerlist = std::get<1>(fplayer.get().Results);
-                for (const auto &player : playerlist)
-                {
-                    myReply += player.Name;
-                    myReply += " [";
-                    myReply += std::to_string(player.Score) + "分";
-                    //int duration = static_cast<int>(player.Duration);
-                    //myReply += std::to_string(duration / 60) + ":" + std::to_string(duration % 60);
-                    myReply += "] / ";
-                }
+        try {
+            auto playerlist = std::get<1>(fplayer.get().Results);
+            for (const auto &player : playerlist) {
+                myReply += player.Name;
+                myReply += " [";
+                myReply += std::to_string(player.Score) + "分";
+                // int duration = static_cast<int>(player.Duration);
+                // myReply += std::to_string(duration / 60) + ":" + std::to_string(duration % 60);
+                myReply += "] / ";
             }
-            catch (const std::exception &)
-            {
-                // ...
-            }
+        } catch (...) {
         }
-
         return myReply;
+    } catch (const std::exception &e) {
+        return e.what();
     }
     return "服务器未响应。";
 }

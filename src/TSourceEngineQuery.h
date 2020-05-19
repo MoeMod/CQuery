@@ -31,6 +31,13 @@ public:
         osx = 'o', // for Mac, the code changed after L4D1
     };
 
+    friend constexpr const char* EnvironmentName(Environment_e env)
+    {
+        return  (env == Environment_e::linux || env == Environment_e::LINUX) ? "Linux" :
+            (env == Environment_e::windows || env == Environment_e::WINDOWS) ? "Windows" :
+            (env == Environment_e::mac || env == Environment_e::osx) ? "macOS" : "Unknown";
+    }
+
     enum Visibility_e : uint8_t
     {
         Public = 0,
@@ -108,11 +115,11 @@ public:
     };
 
     TSourceEngineQuery();
-    std::shared_future<ServerInfoQueryResult> GetServerInfoDataAsync(const char *host, const char *port);
-    std::shared_future<PlayerListQueryResult> GetPlayerListDataAsync(const char *host, const char *port);
+    ~TSourceEngineQuery();
+    std::future<ServerInfoQueryResult> GetServerInfoDataAsync(const char *host, const char *port, std::chrono::seconds timeout);
+    std::future<PlayerListQueryResult> GetPlayerListDataAsync(const char *host, const char *port, std::chrono::seconds timeout);
 
 public:
-
     static ServerInfoQueryResult MakeServerInfoQueryResultFromBuffer(const char *reply, std::size_t reply_length, std::string address, uint16_t port);
     static PlayerListQueryResult MakePlayerListQueryResultFromBuffer(const char *reply, std::size_t reply_length, std::string address, uint16_t port);
 
